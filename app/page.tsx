@@ -6,25 +6,26 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
 const PLAYER_RADIUS = 0.6;
-const GRAVITY = -28;
-const SURF_ACCEL = 38;
-const AIR_ACCEL = 18;
-const MAX_AIR_SPEED = 12;
+const GRAVITY = -30;
+const MAX_SPEED = 3000;
+const FRICTION = 4.0;
+const STOP_SPEED = 100;
+const AIR_ACCEL = 800;
+const MAX_AIR_SPEED = 30;
 const JUMP_SPEED = 8;
-const AIR_TURN_BOOST = 28;
 const TOUCH_LOOK_SENSITIVITY = 0.004;
 const TOUCH_MOVE_RADIUS = 60;
 
 const rampConfigs = [
   {
-    size: new THREE.Vector3(34, 2, 22),
-    position: new THREE.Vector3(-12, -2, 0),
-    rotation: new THREE.Euler(-Math.PI / 5, 0, Math.PI / 6),
+    size: new THREE.Vector3(40, 2, 30),
+    position: new THREE.Vector3(-15, -4, 0),
+    rotation: new THREE.Euler(0, 0, Math.PI / 6),
   },
   {
-    size: new THREE.Vector3(34, 2, 22),
-    position: new THREE.Vector3(12, -2, 0),
-    rotation: new THREE.Euler(-Math.PI / 5, 0, -Math.PI / 6),
+    size: new THREE.Vector3(40, 2, 30),
+    position: new THREE.Vector3(15, -4, 0),
+    rotation: new THREE.Euler(0, 0, -Math.PI / 6),
   },
 ];
 
@@ -33,7 +34,7 @@ const groundConfig = {
   position: new THREE.Vector3(0, -6, 0),
 };
 
-const spawnPoint = new THREE.Vector3(0, 10, -8);
+const spawnPoint = new THREE.Vector3(0, 15, 0);
 
 const clampMagnitude = (value: number, max: number) =>
   Math.max(-max, Math.min(max, value));
@@ -237,7 +238,9 @@ const PlayerController = ({
   const tempVec = useMemo(() => new THREE.Vector3(), []);
 
   useFrame((state, delta) => {
-    const clampedDelta = clampMagnitude(delta, 0.05);
+    const clampedDelta = Math.min(delta, 0.05);
+    
+    // Handle resets
     if (resetSignal !== lastReset.current) {
       position.current.copy(spawnPoint);
       velocity.current.set(0, 0, 0);
@@ -247,6 +250,8 @@ const PlayerController = ({
       position.current.copy(spawnPoint);
       velocity.current.set(0, 0, 0);
     }
+
+    // Mobile camera control
     if (isMobile) {
       const lookDelta = consumeLookDelta();
       yawRef.current -= lookDelta.x * TOUCH_LOOK_SENSITIVITY;
@@ -256,126 +261,139 @@ const PlayerController = ({
       );
       camera.rotation.set(pitchRef.current, yawRef.current, 0);
     }
+
     const yaw = camera.rotation.y;
-    const yawDelta = THREE.MathUtils.euclideanModulo(
-      yaw - previousYaw.current + Math.PI,
-      Math.PI * 2
-    ) - Math.PI;
     previousYaw.current = yaw;
 
+    // Input handling
     const touchForward = -touchMove.y;
     const touchRight = touchMove.x;
-    const forwardInput =
-      (keys.w ? 1 : 0) + (keys.s ? -1 : 0) + touchForward;
+    const forwardInput = (keys.w ? 1 : 0) + (keys.s ? -1 : 0) + touchForward;
     const rightInput = (keys.d ? 1 : 0) + (keys.a ? -1 : 0) + touchRight;
 
-    const forward = new THREE.Vector3(0, 0, -1).applyEuler(
-      new THREE.Euler(0, yaw, 0)
-    );
-    const right = new THREE.Vector3(1, 0, 0).applyEuler(
-      new THREE.Euler(0, yaw, 0)
-    );
+    const forward = new THREE.Vector3(0, 0, -1).applyEuler(new THREE.Euler(0, yaw, 0));
+    const right = new THREE.Vector3(1, 0, 0).applyEuler(new THREE.Euler(0, yaw, 0));
 
+    // Build wish direction
+    const wishDir = new THREE.Vector3();
+    if (forwardInput !== 0) wishDir.addScaledVector(forward, forwardInput);
+    if (rightInput !== 0) wishDir.addScaledVector(right, rightInput);
+    if (wishDir.lengthSq() > 0) wishDir.normalize();
+
+    // Check for surfing collision
     let isSurfing = false;
     let surfNormal: THREE.Vector3 | null = null;
 
     rampRefs.current.forEach((ramp, index) => {
-      if (!ramp) return;
+      if (!ramp || isSurfing) return;
+      
       const config = rampConfigs[index];
-      // Transform player into ramp-local space so we can do bounds checks.
       rampInverse.copy(ramp.matrixWorld).invert();
       rampLocal.copy(position.current).applyMatrix4(rampInverse);
+      
       const half = config.size.clone().multiplyScalar(0.5);
-      const withinX = Math.abs(rampLocal.x) <= half.x + PLAYER_RADIUS;
-      const withinZ = Math.abs(rampLocal.z) <= half.z + PLAYER_RADIUS;
+      const withinX = Math.abs(rampLocal.x) <= half.x + PLAYER_RADIUS * 2;
+      const withinZ = Math.abs(rampLocal.z) <= half.z + PLAYER_RADIUS * 2;
       const topSurface = half.y;
-      const withinY =
-        rampLocal.y <= topSurface + PLAYER_RADIUS &&
-        rampLocal.y >= topSurface - PLAYER_RADIUS * 1.5;
+      const withinY = rampLocal.y <= topSurface + PLAYER_RADIUS * 2 && 
+                      rampLocal.y >= topSurface - PLAYER_RADIUS * 2;
+      
       if (!withinX || !withinZ || !withinY) return;
 
       const { normal, planePoint } = getPlaneInfo(ramp);
-      // Signed distance from the player to the ramp plane.
       const distance = tempVec.subVectors(position.current, planePoint).dot(normal);
-      if (distance > PLAYER_RADIUS * 1.3) return;
-
-      // If we're close and moving into the ramp, we "stick" to it.
-      const movingIntoRamp = velocity.current.dot(normal) <= 2;
-      const wantsContact = movingIntoRamp || distance <= PLAYER_RADIUS * 0.9;
-      if (!wantsContact) return;
-
-      surfNormal = normal;
-      isSurfing = true;
-      const correction = normal.clone().multiplyScalar(PLAYER_RADIUS - distance);
-      position.current.add(correction);
+      
+      if (distance < PLAYER_RADIUS * 1.5 && distance > -PLAYER_RADIUS * 0.5) {
+        surfNormal = normal;
+        isSurfing = true;
+        
+        // Snap to surface
+        const correction = (PLAYER_RADIUS - distance);
+        position.current.addScaledVector(normal, correction);
+      }
     });
 
     if (isSurfing && surfNormal) {
-      const normal = surfNormal as unknown as THREE.Vector3;
-      const gravity = new THREE.Vector3(0, GRAVITY, 0) as unknown as THREE.Vector3;
-      // Surfing: remove gravity's normal component so it accelerates down the slope.
-      const gravityAlongPlane = gravity
-        .clone()
-        .sub(normal.clone().multiplyScalar(gravity.dot(normal)));
-      velocity.current.addScaledVector(gravityAlongPlane, clampedDelta);
-
-      const strafeInput = rightInput;
-      if (strafeInput !== 0) {
-        // A/D steer along the ramp surface; project the force to keep it planar.
-        const surfSteer = right.clone().multiplyScalar(SURF_ACCEL * strafeInput);
-        const surfSteerProjected = surfSteer
-          .sub(normal.clone().multiplyScalar(surfSteer.dot(normal)));
-        velocity.current.addScaledVector(surfSteerProjected, clampedDelta);
+      // CS-style surfing physics
+      const normal = surfNormal.clone();
+      
+      // Project velocity onto the ramp surface
+      const normalVel = velocity.current.dot(normal);
+      velocity.current.addScaledVector(normal, -normalVel);
+      
+      // Apply gravity along the surface
+      const gravityVec = new THREE.Vector3(0, GRAVITY, 0);
+      const gravityNormal = gravityVec.dot(normal);
+      const gravityTangent = gravityVec.clone().addScaledVector(normal, -gravityNormal);
+      velocity.current.addScaledVector(gravityTangent, clampedDelta);
+      
+      // Air acceleration for strafing on ramps
+      if (wishDir.lengthSq() > 0) {
+        // Project wish direction onto surface
+        const wishNormal = wishDir.dot(normal);
+        const wishTangent = wishDir.clone().addScaledVector(normal, -wishNormal);
+        if (wishTangent.lengthSq() > 0) {
+          wishTangent.normalize();
+          
+          const currentSpeed = velocity.current.dot(wishTangent);
+          const addSpeed = AIR_ACCEL * clampedDelta;
+          const accelSpeed = Math.min(addSpeed, MAX_SPEED - currentSpeed);
+          
+          if (accelSpeed > 0) {
+            velocity.current.addScaledVector(wishTangent, accelSpeed);
+          }
+        }
       }
-
-      // Kill any upward component so we don't bounce off the ramp.
-      const normalSpeed = velocity.current.dot(normal);
-      velocity.current.addScaledVector(normal, -normalSpeed);
-
+      
+      // Apply friction
+      const speed = velocity.current.length();
+      if (speed > 0) {
+        const control = Math.max(speed, STOP_SPEED);
+        const drop = control * FRICTION * clampedDelta;
+        const newSpeed = Math.max(speed - drop, 0);
+        velocity.current.multiplyScalar(newSpeed / speed);
+      }
+      
+      // Jump
       if ((keys.space || touchJump) && !jumpLock.current) {
         velocity.current.addScaledVector(normal, JUMP_SPEED);
         jumpLock.current = true;
-        isSurfing = false;
       }
       if (!keys.space && !touchJump) {
         jumpLock.current = false;
       }
     } else {
-      const gravity = new THREE.Vector3(0, GRAVITY, 0);
-      velocity.current.addScaledVector(gravity, clampedDelta);
-
-      const wishDirection = new THREE.Vector3();
-      if (forwardInput !== 0) {
-        wishDirection.addScaledVector(forward, forwardInput);
-      }
-      if (rightInput !== 0) {
-        wishDirection.addScaledVector(right, rightInput);
-      }
-      if (wishDirection.lengthSq() > 0) {
-        wishDirection.normalize();
-        // Quake-style air acceleration: push velocity toward desired direction.
-        const currentSpeed = velocity.current.dot(wishDirection);
-        const addSpeed = Math.max(MAX_AIR_SPEED - currentSpeed, 0);
+      // Air movement (true Quake/CS air strafing)
+      velocity.current.y += GRAVITY * clampedDelta;
+      
+      if (wishDir.lengthSq() > 0) {
+        const currentSpeed = velocity.current.dot(wishDir);
+        const addSpeed = MAX_AIR_SPEED - currentSpeed;
+        
         if (addSpeed > 0) {
-          const accelSpeed = Math.min(
-            AIR_ACCEL * MAX_AIR_SPEED * clampedDelta,
-            addSpeed
-          );
-          velocity.current.addScaledVector(wishDirection, accelSpeed);
+          const accelSpeed = Math.min(AIR_ACCEL * clampedDelta, addSpeed);
+          velocity.current.addScaledVector(wishDir, accelSpeed);
         }
       }
-
-      const strafeSign = Math.sign(rightInput);
-      const turnSign = Math.sign(yawDelta);
-      if (strafeSign !== 0 && forwardInput > 0 && turnSign === strafeSign) {
-        // Air-strafing boost: yawing into the strafe adds speed (curved trajectory).
-        const turnBoost = Math.abs(yawDelta) * AIR_TURN_BOOST;
-        velocity.current.addScaledVector(right, turnBoost);
+      
+      if (!keys.space && !touchJump) {
+        jumpLock.current = false;
       }
     }
 
+    // Clamp velocity
+    const horizontalVel = new THREE.Vector3(velocity.current.x, 0, velocity.current.z);
+    const hSpeed = horizontalVel.length();
+    if (hSpeed > MAX_SPEED) {
+      const ratio = MAX_SPEED / hSpeed;
+      velocity.current.x *= ratio;
+      velocity.current.z *= ratio;
+    }
+
+    // Update position
     position.current.addScaledVector(velocity.current, clampedDelta);
 
+    // Ground collision
     const groundTop = groundConfig.position.y + groundConfig.size.y * 0.5;
     if (!isSurfing && position.current.y - PLAYER_RADIUS < groundTop) {
       position.current.y = groundTop + PLAYER_RADIUS;
@@ -384,11 +402,8 @@ const PlayerController = ({
       }
     }
 
-    if (
-      position.current.y < -25 ||
-      Math.abs(position.current.x) > 240 ||
-      Math.abs(position.current.z) > 240
-    ) {
+    // Out of bounds reset
+    if (position.current.y < -25 || Math.abs(position.current.x) > 240 || Math.abs(position.current.z) > 240) {
       position.current.copy(spawnPoint);
       velocity.current.set(0, 0, 0);
     }
