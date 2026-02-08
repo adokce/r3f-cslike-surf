@@ -60,7 +60,7 @@ const useKeyMap = () => {
   return keys;
 };
 
-const getPlaneInfo = (rampRef: React.RefObject<THREE.Mesh>) => {
+const getPlaneInfo = (rampRef: React.RefObject<THREE.Mesh | null>) => {
   if (!rampRef.current) {
     return null;
   }
@@ -77,7 +77,7 @@ const PlayerController = ({
   rampRef,
   onSpeedChange,
 }: {
-  rampRef: React.RefObject<THREE.Mesh>;
+  rampRef: React.RefObject<THREE.Mesh | null>;
   onSpeedChange: (speed: number) => void;
 }) => {
   const { camera } = useThree();
@@ -222,7 +222,11 @@ const PlayerController = ({
   return null;
 };
 
-const Ramp = ({ rampRef }: { rampRef: React.RefObject<THREE.Mesh> }) => (
+const Ramp = ({
+  rampRef,
+}: {
+  rampRef: React.RefObject<THREE.Mesh | null>;
+}) => (
   <mesh
     ref={rampRef}
     rotation={rampConfig.rotation}
