@@ -12,11 +12,18 @@ const AIR_ACCEL = 18;
 const MAX_AIR_SPEED = 12;
 const JUMP_SPEED = 8;
 const AIR_TURN_BOOST = 28;
+const TOUCH_LOOK_SENSITIVITY = 0.004;
+const TOUCH_MOVE_RADIUS = 60;
 
 const rampConfig = {
   size: new THREE.Vector3(34, 2, 22),
   position: new THREE.Vector3(0, -2, 0),
   rotation: new THREE.Euler(-Math.PI / 5, 0, 0),
+};
+
+const groundConfig = {
+  size: new THREE.Vector3(120, 2, 120),
+  position: new THREE.Vector3(0, -6, 0),
 };
 
 const spawnPoint = new THREE.Vector3(0, 10, -8);
@@ -60,6 +67,123 @@ const useKeyMap = () => {
   return keys;
 };
 
+const useIsMobile = () => {
+  const [isMobile, setIsMobile] = useState(false);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(pointer: coarse)");
+    const update = () =>
+      setIsMobile(
+        mediaQuery.matches ||
+          /android|iphone|ipad|ipod/i.test(navigator.userAgent)
+      );
+    update();
+    mediaQuery.addEventListener("change", update);
+    return () => mediaQuery.removeEventListener("change", update);
+  }, []);
+
+  return isMobile;
+};
+
+const useTouchControls = () => {
+  const [move, setMove] = useState({ x: 0, y: 0 });
+  const [jump, setJump] = useState(false);
+  const lookDelta = useRef({ x: 0, y: 0 });
+  const moveTouch = useRef<
+    { id: number; origin: { x: number; y: number } } | undefined
+  >(undefined);
+  const lookTouch = useRef<
+    { id: number; origin: { x: number; y: number } } | undefined
+  >(undefined);
+
+  const handleMoveStart = (event: React.TouchEvent<HTMLDivElement>) => {
+    const touch = event.changedTouches[0];
+    moveTouch.current = {
+      id: touch.identifier,
+      origin: { x: touch.clientX, y: touch.clientY },
+    };
+  };
+
+  const handleMove = (event: React.TouchEvent<HTMLDivElement>) => {
+    if (!moveTouch.current) return;
+    const touch = Array.from(event.changedTouches).find(
+      (item) => item.identifier === moveTouch.current?.id
+    );
+    if (!touch) return;
+    const dx = touch.clientX - moveTouch.current.origin.x;
+    const dy = touch.clientY - moveTouch.current.origin.y;
+    const clampedX = clampMagnitude(dx, TOUCH_MOVE_RADIUS);
+    const clampedY = clampMagnitude(dy, TOUCH_MOVE_RADIUS);
+    setMove({
+      x: clampedX / TOUCH_MOVE_RADIUS,
+      y: clampedY / TOUCH_MOVE_RADIUS,
+    });
+  };
+
+  const handleMoveEnd = (event: React.TouchEvent<HTMLDivElement>) => {
+    const touch = Array.from(event.changedTouches).find(
+      (item) => item.identifier === moveTouch.current?.id
+    );
+    if (touch) {
+      moveTouch.current = undefined;
+      setMove({ x: 0, y: 0 });
+    }
+  };
+
+  const handleLookStart = (event: React.TouchEvent<HTMLDivElement>) => {
+    const touch = event.changedTouches[0];
+    lookTouch.current = {
+      id: touch.identifier,
+      origin: { x: touch.clientX, y: touch.clientY },
+    };
+  };
+
+  const handleLook = (event: React.TouchEvent<HTMLDivElement>) => {
+    if (!lookTouch.current) return;
+    const touch = Array.from(event.changedTouches).find(
+      (item) => item.identifier === lookTouch.current?.id
+    );
+    if (!touch) return;
+    const dx = touch.clientX - lookTouch.current.origin.x;
+    const dy = touch.clientY - lookTouch.current.origin.y;
+    lookTouch.current.origin = { x: touch.clientX, y: touch.clientY };
+    lookDelta.current = {
+      x: lookDelta.current.x + dx,
+      y: lookDelta.current.y + dy,
+    };
+  };
+
+  const handleLookEnd = (event: React.TouchEvent<HTMLDivElement>) => {
+    const touch = Array.from(event.changedTouches).find(
+      (item) => item.identifier === lookTouch.current?.id
+    );
+    if (touch) {
+      lookTouch.current = undefined;
+    }
+  };
+
+  const consumeLookDelta = () => {
+    const delta = { ...lookDelta.current };
+    lookDelta.current = { x: 0, y: 0 };
+    return delta;
+  };
+
+  return {
+    move,
+    jump,
+    setJump,
+    consumeLookDelta,
+    handlers: {
+      handleMoveStart,
+      handleMove,
+      handleMoveEnd,
+      handleLookStart,
+      handleLook,
+      handleLookEnd,
+    },
+  };
+};
+
 const getPlaneInfo = (rampRef: React.RefObject<THREE.Mesh | null>) => {
   if (!rampRef.current) {
     return null;
@@ -76,15 +200,25 @@ const getPlaneInfo = (rampRef: React.RefObject<THREE.Mesh | null>) => {
 const PlayerController = ({
   rampRef,
   onSpeedChange,
+  isMobile,
+  touchMove,
+  touchJump,
+  consumeLookDelta,
 }: {
   rampRef: React.RefObject<THREE.Mesh | null>;
   onSpeedChange: (speed: number) => void;
+  isMobile: boolean;
+  touchMove: { x: number; y: number };
+  touchJump: boolean;
+  consumeLookDelta: () => { x: number; y: number };
 }) => {
   const { camera } = useThree();
   const keys = useKeyMap();
   const velocity = useRef(new THREE.Vector3(0, 0, 0));
   const position = useRef(spawnPoint.clone());
   const previousYaw = useRef(0);
+  const yawRef = useRef(0);
+  const pitchRef = useRef(0);
   const jumpLock = useRef(false);
 
   const rampInverse = useMemo(() => new THREE.Matrix4(), []);
@@ -92,6 +226,15 @@ const PlayerController = ({
 
   useFrame((state, delta) => {
     const clampedDelta = clampMagnitude(delta, 0.05);
+    if (isMobile) {
+      const lookDelta = consumeLookDelta();
+      yawRef.current -= lookDelta.x * TOUCH_LOOK_SENSITIVITY;
+      pitchRef.current = clampMagnitude(
+        pitchRef.current - lookDelta.y * TOUCH_LOOK_SENSITIVITY,
+        1.45
+      );
+      camera.rotation.set(pitchRef.current, yawRef.current, 0);
+    }
     const yaw = camera.rotation.y;
     const yawDelta = THREE.MathUtils.euclideanModulo(
       yaw - previousYaw.current + Math.PI,
@@ -99,8 +242,11 @@ const PlayerController = ({
     ) - Math.PI;
     previousYaw.current = yaw;
 
-    const forwardInput = (keys.w ? 1 : 0) + (keys.s ? -1 : 0);
-    const rightInput = (keys.d ? 1 : 0) + (keys.a ? -1 : 0);
+    const touchForward = -touchMove.y;
+    const touchRight = touchMove.x;
+    const forwardInput =
+      (keys.w ? 1 : 0) + (keys.s ? -1 : 0) + touchForward;
+    const rightInput = (keys.d ? 1 : 0) + (keys.a ? -1 : 0) + touchRight;
 
     const forward = new THREE.Vector3(0, 0, -1).applyEuler(
       new THREE.Euler(0, yaw, 0)
@@ -129,15 +275,16 @@ const PlayerController = ({
         const distance = new THREE.Vector3()
           .subVectors(position.current, planeInfo.planePoint)
           .dot(normal);
-        if (distance <= PLAYER_RADIUS * 1.2) {
+        if (distance <= PLAYER_RADIUS * 1.3) {
           // If we're close and moving into the ramp, we "stick" to it.
-          isSurfing = velocity.current.dot(normal) <= 8;
-          if (isSurfing) {
-            const correction = normal
-              .clone()
-              .multiplyScalar(PLAYER_RADIUS - distance);
-            position.current.add(correction);
-          }
+          const movingIntoRamp = velocity.current.dot(normal) <= 2;
+          isSurfing = movingIntoRamp || distance <= PLAYER_RADIUS * 0.9;
+        }
+        if (isSurfing) {
+          const correction = normal
+            .clone()
+            .multiplyScalar(PLAYER_RADIUS - distance);
+          position.current.add(correction);
         }
       }
     }
@@ -166,12 +313,12 @@ const PlayerController = ({
         velocity.current.addScaledVector(normal, -normalSpeed);
       }
 
-      if (keys.space && !jumpLock.current) {
+      if ((keys.space || touchJump) && !jumpLock.current) {
         velocity.current.addScaledVector(normal, JUMP_SPEED);
         jumpLock.current = true;
         isSurfing = false;
       }
-      if (!keys.space) {
+      if (!keys.space && !touchJump) {
         jumpLock.current = false;
       }
     } else {
@@ -210,6 +357,14 @@ const PlayerController = ({
 
     position.current.addScaledVector(velocity.current, clampedDelta);
 
+    const groundTop = groundConfig.position.y + groundConfig.size.y * 0.5;
+    if (!isSurfing && position.current.y - PLAYER_RADIUS < groundTop) {
+      position.current.y = groundTop + PLAYER_RADIUS;
+      if (velocity.current.y < 0) {
+        velocity.current.y = 0;
+      }
+    }
+
     if (position.current.y < -25) {
       position.current.copy(spawnPoint);
       velocity.current.set(0, 0, 0);
@@ -240,7 +395,19 @@ const Ramp = ({
   </mesh>
 );
 
-const Scene = ({ onSpeedChange }: { onSpeedChange: (speed: number) => void }) => {
+const Scene = ({
+  onSpeedChange,
+  isMobile,
+  touchMove,
+  touchJump,
+  consumeLookDelta,
+}: {
+  onSpeedChange: (speed: number) => void;
+  isMobile: boolean;
+  touchMove: { x: number; y: number };
+  touchJump: boolean;
+  consumeLookDelta: () => { x: number; y: number };
+}) => {
   const rampRef = useRef<THREE.Mesh>(null);
   return (
     <>
@@ -248,27 +415,47 @@ const Scene = ({ onSpeedChange }: { onSpeedChange: (speed: number) => void }) =>
       <ambientLight intensity={0.35} />
       <directionalLight position={[6, 12, 6]} intensity={0.9} />
       <Ramp rampRef={rampRef} />
-      <mesh position={[0, -6, 0]} receiveShadow>
-        <boxGeometry args={[120, 2, 120]} />
+      <mesh position={groundConfig.position.toArray()} receiveShadow>
+        <boxGeometry args={groundConfig.size.toArray()} />
         <meshStandardMaterial color="#111827" />
       </mesh>
-      <PlayerController rampRef={rampRef} onSpeedChange={onSpeedChange} />
-      <PointerLockControls />
+      <PlayerController
+        rampRef={rampRef}
+        onSpeedChange={onSpeedChange}
+        isMobile={isMobile}
+        touchMove={touchMove}
+        touchJump={touchJump}
+        consumeLookDelta={consumeLookDelta}
+      />
+      {!isMobile && <PointerLockControls />}
     </>
   );
 };
 
 export default function Home() {
   const [speed, setSpeed] = useState(0);
+  const isMobile = useIsMobile();
+  const { move, jump, setJump, consumeLookDelta, handlers } =
+    useTouchControls();
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-black text-white">
       <Canvas
         shadows
         camera={{ fov: 80, near: 0.1, far: 200, position: spawnPoint.toArray() }}
-        onPointerDown={(event) => event.currentTarget.requestPointerLock()}
+        onPointerDown={(event) => {
+          if (!isMobile) {
+            event.currentTarget.requestPointerLock();
+          }
+        }}
       >
-        <Scene onSpeedChange={setSpeed} />
+        <Scene
+          onSpeedChange={setSpeed}
+          isMobile={isMobile}
+          touchMove={move}
+          touchJump={jump}
+          consumeLookDelta={consumeLookDelta}
+        />
       </Canvas>
       <div className="pointer-events-none absolute left-6 top-6 flex flex-col gap-2 rounded-lg bg-black/60 px-4 py-3 text-sm font-semibold uppercase tracking-wide">
         <span className="text-xs text-blue-200">Surf Velocity</span>
@@ -280,8 +467,39 @@ export default function Home() {
         </span>
       </div>
       <div className="pointer-events-none absolute bottom-6 left-1/2 -translate-x-1/2 text-xs text-slate-300">
-        Click to lock mouse. Drop onto the wave and carve across the slope.
+        Click to lock mouse. On mobile, use the touch pads to surf.
       </div>
+      {isMobile && (
+        <>
+          <div
+            className="pointer-events-auto absolute bottom-8 left-6 h-32 w-32 rounded-full border border-white/30 bg-white/5"
+            onTouchStart={handlers.handleMoveStart}
+            onTouchMove={handlers.handleMove}
+            onTouchEnd={handlers.handleMoveEnd}
+            onTouchCancel={handlers.handleMoveEnd}
+          >
+            <div className="absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white/20" />
+          </div>
+          <div
+            className="pointer-events-auto absolute bottom-8 right-6 h-32 w-32 rounded-full border border-white/30 bg-white/5"
+            onTouchStart={handlers.handleLookStart}
+            onTouchMove={handlers.handleLook}
+            onTouchEnd={handlers.handleLookEnd}
+            onTouchCancel={handlers.handleLookEnd}
+          >
+            <div className="absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white/20" />
+          </div>
+          <button
+            type="button"
+            className="pointer-events-auto absolute bottom-10 right-44 rounded-full border border-white/40 bg-white/10 px-4 py-2 text-xs uppercase tracking-wide"
+            onTouchStart={() => setJump(true)}
+            onTouchEnd={() => setJump(false)}
+            onTouchCancel={() => setJump(false)}
+          >
+            Jump
+          </button>
+        </>
+      )}
     </div>
   );
 }
