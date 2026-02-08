@@ -1,0 +1,5 @@
+#!/bin/sh
+# Prevent pushing if the Next.js production build fails (Vercel parity).
+
+printf "%s\n" "Running build check before push..."
+pnpm run build
