@@ -1,72 +1,131 @@
 "use client";
 
-import { PointerLockControls } from "@react-three/drei";
+import { PointerLockControls, Sky } from "@react-three/drei";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import {
+  createRampFromBox,
+  GRAVITY,
+  stepSurfPhysics,
+  type SurfState,
+} from "@/lib/surfPhysics";
 
-const PLAYER_RADIUS = 0.6;
-const GRAVITY = -28;
-const SURF_ACCEL = 38;
-const AIR_ACCEL = 18;
-const MAX_AIR_SPEED = 12;
-const JUMP_SPEED = 8;
-const AIR_TURN_BOOST = 28;
-const TOUCH_LOOK_SENSITIVITY = 0.004;
-const TOUCH_MOVE_RADIUS = 60;
-
-const rampConfigs = [
-  {
-    size: new THREE.Vector3(34, 2, 22),
-    position: new THREE.Vector3(-12, -2, 0),
-    rotation: new THREE.Euler(-Math.PI / 5, 0, Math.PI / 6),
-  },
-  {
-    size: new THREE.Vector3(34, 2, 22),
-    position: new THREE.Vector3(12, -2, 0),
-    rotation: new THREE.Euler(-Math.PI / 5, 0, -Math.PI / 6),
-  },
-];
-
-const groundConfig = {
-  size: new THREE.Vector3(120, 2, 120),
-  position: new THREE.Vector3(0, -6, 0),
+const WAVE_CONFIG = {
+  size: new THREE.Vector3(180, 2.4, 720),
+  position: new THREE.Vector3(0, 16, 0),
+  rotation: new THREE.Euler(0, -0.2, 1.02),
 };
 
-const spawnPoint = new THREE.Vector3(0, 10, -8);
+const WAVE_RAMP = createRampFromBox(WAVE_CONFIG);
+const DOWNHILL_DIRECTION = new THREE.Vector3(0, GRAVITY, 0)
+  .addScaledVector(
+    WAVE_RAMP.normal,
+    -new THREE.Vector3(0, GRAVITY, 0).dot(WAVE_RAMP.normal),
+  )
+  .normalize();
 
-const clampMagnitude = (value: number, max: number) =>
-  Math.max(-max, Math.min(max, value));
+const SLOPE_DOWN = DOWNHILL_DIRECTION.clone();
+const SLOPE_ACROSS = new THREE.Vector3()
+  .crossVectors(WAVE_RAMP.normal, SLOPE_DOWN)
+  .normalize();
+
+const SLOPE_SPAN =
+  Math.abs(SLOPE_DOWN.dot(WAVE_RAMP.right)) * WAVE_RAMP.halfWidth +
+  Math.abs(SLOPE_DOWN.dot(WAVE_RAMP.forward)) * WAVE_RAMP.halfLength;
+
+const ACROSS_SPAN =
+  Math.abs(SLOPE_ACROSS.dot(WAVE_RAMP.right)) * WAVE_RAMP.halfWidth +
+  Math.abs(SLOPE_ACROSS.dot(WAVE_RAMP.forward)) * WAVE_RAMP.halfLength;
+
+const surfacePoint = (
+  downhillFactor: number,
+  acrossFactor: number,
+  normalLift = 0.2,
+) =>
+  WAVE_RAMP.surfaceCenter
+    .clone()
+    .addScaledVector(SLOPE_DOWN, SLOPE_SPAN * downhillFactor)
+    .addScaledVector(SLOPE_ACROSS, ACROSS_SPAN * acrossFactor)
+    .addScaledVector(WAVE_RAMP.normal, normalLift);
+
+const SPAWN_POINT = surfacePoint(-0.96, 0.52, 62);
+
+const UPHILL_BEACON = surfacePoint(-0.87, 0, 1.3);
+const DOWNHILL_BEACON = surfacePoint(0.87, 0, 1.3);
+
+const UPHILL_RGB = { r: 245, g: 158, b: 11 };
+const DOWNHILL_RGB = { r: 34, g: 211, b: 238 };
+const toHexChannel = (value: number) =>
+  Math.round(Math.max(0, Math.min(255, value)))
+    .toString(16)
+    .padStart(2, "0");
+const mixColor = (t: number) => {
+  const r = UPHILL_RGB.r + (DOWNHILL_RGB.r - UPHILL_RGB.r) * t;
+  const g = UPHILL_RGB.g + (DOWNHILL_RGB.g - UPHILL_RGB.g) * t;
+  const b = UPHILL_RGB.b + (DOWNHILL_RGB.b - UPHILL_RGB.b) * t;
+  return `#${toHexChannel(r)}${toHexChannel(g)}${toHexChannel(b)}`;
+};
+
+const FLOW_MARKERS = (() => {
+  const markers: Array<{
+    position: THREE.Vector3;
+    color: string;
+    size: number;
+  }> = [];
+
+  for (let index = 0; index < 22; index += 1) {
+    const t = index / 21;
+    const downhillFactor = -0.85 + t * 1.7;
+    const color = mixColor(t);
+
+    markers.push({
+      position: surfacePoint(downhillFactor, 0, 0.16),
+      color,
+      size: 0.5,
+    });
+    markers.push({
+      position: surfacePoint(downhillFactor, -0.33, 0.12),
+      color,
+      size: 0.34,
+    });
+    markers.push({
+      position: surfacePoint(downhillFactor, 0.33, 0.12),
+      color,
+      size: 0.34,
+    });
+  }
+
+  return markers;
+})();
+
+const WORLD_RESET_HEIGHT = -260;
+const WORLD_BOUNDS = 1500;
 
 const useKeyMap = () => {
   const [keys, setKeys] = useState({
-    w: false,
     a: false,
-    s: false,
     d: false,
-    space: false,
     r: false,
   });
 
   useEffect(() => {
-    const handleKey = (event: KeyboardEvent, pressed: boolean) => {
+    const onKeyEvent = (event: KeyboardEvent, pressed: boolean) => {
       const key = event.key.toLowerCase();
-      setKeys((prev) => ({
-        ...prev,
-        w: key === "w" ? pressed : prev.w,
-        a: key === "a" ? pressed : prev.a,
-        s: key === "s" ? pressed : prev.s,
-        d: key === "d" ? pressed : prev.d,
-        space: key === " " ? pressed : prev.space,
-        r: key === "r" ? pressed : prev.r,
+      setKeys((previous) => ({
+        ...previous,
+        a: key === "a" ? pressed : previous.a,
+        d: key === "d" ? pressed : previous.d,
+        r: key === "r" ? pressed : previous.r,
       }));
     };
 
-    const onKeyDown = (event: KeyboardEvent) => handleKey(event, true);
-    const onKeyUp = (event: KeyboardEvent) => handleKey(event, false);
+    const onKeyDown = (event: KeyboardEvent) => onKeyEvent(event, true);
+    const onKeyUp = (event: KeyboardEvent) => onKeyEvent(event, false);
 
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
@@ -76,473 +135,226 @@ const useKeyMap = () => {
   return keys;
 };
 
-const useIsMobile = () => {
-  const [isMobile, setIsMobile] = useState(false);
-
-  useEffect(() => {
-    const mediaQuery = window.matchMedia("(pointer: coarse)");
-    const update = () =>
-      setIsMobile(
-        mediaQuery.matches ||
-          /android|iphone|ipad|ipod/i.test(navigator.userAgent)
-      );
-    update();
-    mediaQuery.addEventListener("change", update);
-    return () => mediaQuery.removeEventListener("change", update);
-  }, []);
-
-  return isMobile;
-};
-
-const useTouchControls = () => {
-  const [move, setMove] = useState({ x: 0, y: 0 });
-  const [jump, setJump] = useState(false);
-  const lookDelta = useRef({ x: 0, y: 0 });
-  const moveTouch = useRef<
-    { id: number; origin: { x: number; y: number } } | undefined
-  >(undefined);
-  const lookTouch = useRef<
-    { id: number; origin: { x: number; y: number } } | undefined
-  >(undefined);
-
-  const handleMoveStart = (event: React.TouchEvent<HTMLDivElement>) => {
-    const touch = event.changedTouches[0];
-    moveTouch.current = {
-      id: touch.identifier,
-      origin: { x: touch.clientX, y: touch.clientY },
-    };
-  };
-
-  const handleMove = (event: React.TouchEvent<HTMLDivElement>) => {
-    if (!moveTouch.current) return;
-    const touch = Array.from(event.changedTouches).find(
-      (item) => item.identifier === moveTouch.current?.id
-    );
-    if (!touch) return;
-    const dx = touch.clientX - moveTouch.current.origin.x;
-    const dy = touch.clientY - moveTouch.current.origin.y;
-    const clampedX = clampMagnitude(dx, TOUCH_MOVE_RADIUS);
-    const clampedY = clampMagnitude(dy, TOUCH_MOVE_RADIUS);
-    setMove({
-      x: clampedX / TOUCH_MOVE_RADIUS,
-      y: clampedY / TOUCH_MOVE_RADIUS,
-    });
-  };
-
-  const handleMoveEnd = (event: React.TouchEvent<HTMLDivElement>) => {
-    const touch = Array.from(event.changedTouches).find(
-      (item) => item.identifier === moveTouch.current?.id
-    );
-    if (touch) {
-      moveTouch.current = undefined;
-      setMove({ x: 0, y: 0 });
-    }
-  };
-
-  const handleLookStart = (event: React.TouchEvent<HTMLDivElement>) => {
-    const touch = event.changedTouches[0];
-    lookTouch.current = {
-      id: touch.identifier,
-      origin: { x: touch.clientX, y: touch.clientY },
-    };
-  };
-
-  const handleLook = (event: React.TouchEvent<HTMLDivElement>) => {
-    if (!lookTouch.current) return;
-    const touch = Array.from(event.changedTouches).find(
-      (item) => item.identifier === lookTouch.current?.id
-    );
-    if (!touch) return;
-    const dx = touch.clientX - lookTouch.current.origin.x;
-    const dy = touch.clientY - lookTouch.current.origin.y;
-    lookTouch.current.origin = { x: touch.clientX, y: touch.clientY };
-    lookDelta.current = {
-      x: lookDelta.current.x + dx,
-      y: lookDelta.current.y + dy,
-    };
-  };
-
-  const handleLookEnd = (event: React.TouchEvent<HTMLDivElement>) => {
-    const touch = Array.from(event.changedTouches).find(
-      (item) => item.identifier === lookTouch.current?.id
-    );
-    if (touch) {
-      lookTouch.current = undefined;
-    }
-  };
-
-  const consumeLookDelta = () => {
-    const delta = { ...lookDelta.current };
-    lookDelta.current = { x: 0, y: 0 };
-    return delta;
-  };
-
-  return {
-    move,
-    jump,
-    setJump,
-    consumeLookDelta,
-    handlers: {
-      handleMoveStart,
-      handleMove,
-      handleMoveEnd,
-      handleLookStart,
-      handleLook,
-      handleLookEnd,
-    },
-  };
-};
-
-const getPlaneInfo = (
-  ramp: THREE.Mesh
-): { normal: THREE.Vector3; planePoint: THREE.Vector3 } => {
-  // Top surface normal in world space (used to project gravity and velocity).
-  const normal = new THREE.Vector3(0, 1, 0)
-    .applyEuler(ramp.rotation)
-    .normalize();
-  // Any point on the plane works; the ramp's origin is centered.
-  const planePoint = new THREE.Vector3().copy(ramp.position);
-  return { normal, planePoint };
+const resetPlayerState = (state: SurfState) => {
+  state.position.copy(SPAWN_POINT);
+  state.velocity.set(0, 0, 0);
+  state.isSurfing = false;
 };
 
 const PlayerController = ({
-  rampRefs,
   onSpeedChange,
-  isMobile,
-  touchMove,
-  touchJump,
-  consumeLookDelta,
-  resetSignal,
+  onSurfStateChange,
 }: {
-  rampRefs: React.RefObject<Array<THREE.Mesh | null>>;
   onSpeedChange: (speed: number) => void;
-  isMobile: boolean;
-  touchMove: { x: number; y: number };
-  touchJump: boolean;
-  consumeLookDelta: () => { x: number; y: number };
-  resetSignal: number;
+  onSurfStateChange: (isSurfing: boolean) => void;
 }) => {
   const { camera } = useThree();
   const keys = useKeyMap();
-  const velocity = useRef(new THREE.Vector3(0, 0, 0));
-  const position = useRef(spawnPoint.clone());
-  const previousYaw = useRef(0);
-  const yawRef = useRef(0);
-  const pitchRef = useRef(0);
-  const lastReset = useRef(resetSignal);
-  const jumpLock = useRef(false);
+  const stateRef = useRef<SurfState>({
+    position: SPAWN_POINT.clone(),
+    velocity: new THREE.Vector3(),
+    isSurfing: false,
+  });
+  const lookDirection = useRef(new THREE.Vector3());
 
-  const rampInverse = useMemo(() => new THREE.Matrix4(), []);
-  const rampLocal = useMemo(() => new THREE.Vector3(), []);
-  const tempVec = useMemo(() => new THREE.Vector3(), []);
+  useEffect(() => {
+    const flatDownhill = DOWNHILL_DIRECTION.clone().setY(0).normalize();
+    const flatForward = WAVE_RAMP.forward.clone().setY(0).normalize();
+    const defaultView = flatDownhill
+      .multiplyScalar(0.84)
+      .add(flatForward.multiplyScalar(0.16));
 
-  useFrame((state, delta) => {
-    const clampedDelta = clampMagnitude(delta, 0.05);
-    if (resetSignal !== lastReset.current) {
-      position.current.copy(spawnPoint);
-      velocity.current.set(0, 0, 0);
-      lastReset.current = resetSignal;
-    }
-    if (keys.r) {
-      position.current.copy(spawnPoint);
-      velocity.current.set(0, 0, 0);
-    }
-    if (isMobile) {
-      const lookDelta = consumeLookDelta();
-      yawRef.current -= lookDelta.x * TOUCH_LOOK_SENSITIVITY;
-      pitchRef.current = clampMagnitude(
-        pitchRef.current - lookDelta.y * TOUCH_LOOK_SENSITIVITY,
-        1.45
-      );
-      camera.rotation.set(pitchRef.current, yawRef.current, 0);
-    }
-    const yaw = camera.rotation.y;
-    const yawDelta = THREE.MathUtils.euclideanModulo(
-      yaw - previousYaw.current + Math.PI,
-      Math.PI * 2
-    ) - Math.PI;
-    previousYaw.current = yaw;
-
-    const touchForward = -touchMove.y;
-    const touchRight = touchMove.x;
-    const forwardInput =
-      (keys.w ? 1 : 0) + (keys.s ? -1 : 0) + touchForward;
-    const rightInput = (keys.d ? 1 : 0) + (keys.a ? -1 : 0) + touchRight;
-
-    const forward = new THREE.Vector3(0, 0, -1).applyEuler(
-      new THREE.Euler(0, yaw, 0)
-    );
-    const right = new THREE.Vector3(1, 0, 0).applyEuler(
-      new THREE.Euler(0, yaw, 0)
-    );
-
-    let isSurfing = false;
-    let surfNormal: THREE.Vector3 | null = null;
-
-    rampRefs.current.forEach((ramp, index) => {
-      if (!ramp) return;
-      const config = rampConfigs[index];
-      // Transform player into ramp-local space so we can do bounds checks.
-      rampInverse.copy(ramp.matrixWorld).invert();
-      rampLocal.copy(position.current).applyMatrix4(rampInverse);
-      const half = config.size.clone().multiplyScalar(0.5);
-      const withinX = Math.abs(rampLocal.x) <= half.x + PLAYER_RADIUS;
-      const withinZ = Math.abs(rampLocal.z) <= half.z + PLAYER_RADIUS;
-      const topSurface = half.y;
-      const withinY =
-        rampLocal.y <= topSurface + PLAYER_RADIUS &&
-        rampLocal.y >= topSurface - PLAYER_RADIUS * 1.5;
-      if (!withinX || !withinZ || !withinY) return;
-
-      const { normal, planePoint } = getPlaneInfo(ramp);
-      // Signed distance from the player to the ramp plane.
-      const distance = tempVec.subVectors(position.current, planePoint).dot(normal);
-      if (distance > PLAYER_RADIUS * 1.3) return;
-
-      // If we're close and moving into the ramp, we "stick" to it.
-      const movingIntoRamp = velocity.current.dot(normal) <= 2;
-      const wantsContact = movingIntoRamp || distance <= PLAYER_RADIUS * 0.9;
-      if (!wantsContact) return;
-
-      surfNormal = normal;
-      isSurfing = true;
-      const correction = normal.clone().multiplyScalar(PLAYER_RADIUS - distance);
-      position.current.add(correction);
-    });
-
-    if (isSurfing && surfNormal) {
-      const normal = surfNormal as unknown as THREE.Vector3;
-      const gravity = new THREE.Vector3(0, GRAVITY, 0) as unknown as THREE.Vector3;
-      // Surfing: remove gravity's normal component so it accelerates down the slope.
-      const gravityAlongPlane = gravity
-        .clone()
-        .sub(normal.clone().multiplyScalar(gravity.dot(normal)));
-      velocity.current.addScaledVector(gravityAlongPlane, clampedDelta);
-
-      const strafeInput = rightInput;
-      if (strafeInput !== 0) {
-        // A/D steer along the ramp surface; project the force to keep it planar.
-        const surfSteer = right.clone().multiplyScalar(SURF_ACCEL * strafeInput);
-        const surfSteerProjected = surfSteer
-          .sub(normal.clone().multiplyScalar(surfSteer.dot(normal)));
-        velocity.current.addScaledVector(surfSteerProjected, clampedDelta);
-      }
-
-      // Kill any upward component so we don't bounce off the ramp.
-      const normalSpeed = velocity.current.dot(normal);
-      velocity.current.addScaledVector(normal, -normalSpeed);
-
-      if ((keys.space || touchJump) && !jumpLock.current) {
-        velocity.current.addScaledVector(normal, JUMP_SPEED);
-        jumpLock.current = true;
-        isSurfing = false;
-      }
-      if (!keys.space && !touchJump) {
-        jumpLock.current = false;
-      }
+    if (defaultView.lengthSq() === 0) {
+      defaultView.set(0, 0, -1);
     } else {
-      const gravity = new THREE.Vector3(0, GRAVITY, 0);
-      velocity.current.addScaledVector(gravity, clampedDelta);
-
-      const wishDirection = new THREE.Vector3();
-      if (forwardInput !== 0) {
-        wishDirection.addScaledVector(forward, forwardInput);
-      }
-      if (rightInput !== 0) {
-        wishDirection.addScaledVector(right, rightInput);
-      }
-      if (wishDirection.lengthSq() > 0) {
-        wishDirection.normalize();
-        // Quake-style air acceleration: push velocity toward desired direction.
-        const currentSpeed = velocity.current.dot(wishDirection);
-        const addSpeed = Math.max(MAX_AIR_SPEED - currentSpeed, 0);
-        if (addSpeed > 0) {
-          const accelSpeed = Math.min(
-            AIR_ACCEL * MAX_AIR_SPEED * clampedDelta,
-            addSpeed
-          );
-          velocity.current.addScaledVector(wishDirection, accelSpeed);
-        }
-      }
-
-      const strafeSign = Math.sign(rightInput);
-      const turnSign = Math.sign(yawDelta);
-      if (strafeSign !== 0 && forwardInput > 0 && turnSign === strafeSign) {
-        // Air-strafing boost: yawing into the strafe adds speed (curved trajectory).
-        const turnBoost = Math.abs(yawDelta) * AIR_TURN_BOOST;
-        velocity.current.addScaledVector(right, turnBoost);
-      }
+      defaultView.normalize();
     }
 
-    position.current.addScaledVector(velocity.current, clampedDelta);
+    camera.position.copy(stateRef.current.position);
+    camera.lookAt(stateRef.current.position.clone().add(defaultView));
+  }, [camera]);
 
-    const groundTop = groundConfig.position.y + groundConfig.size.y * 0.5;
-    if (!isSurfing && position.current.y - PLAYER_RADIUS < groundTop) {
-      position.current.y = groundTop + PLAYER_RADIUS;
-      if (velocity.current.y < 0) {
-        velocity.current.y = 0;
-      }
+  useFrame((_, delta) => {
+    const sideInput = (keys.d ? 1 : 0) + (keys.a ? -1 : 0);
+
+    const playerState = stateRef.current;
+    if (keys.r) {
+      resetPlayerState(playerState);
     }
+
+    camera.getWorldDirection(lookDirection.current);
+    lookDirection.current.y = 0;
+    if (lookDirection.current.lengthSq() < 1e-8) {
+      lookDirection.current.set(0, 0, -1);
+    } else {
+      lookDirection.current.normalize();
+    }
+
+    const yaw = Math.atan2(lookDirection.current.x, -lookDirection.current.z);
+
+    stepSurfPhysics(
+      playerState,
+      {
+        delta,
+        yaw,
+        moveForward: 0,
+        moveRight: sideInput,
+      },
+      WAVE_RAMP,
+    );
 
     if (
-      position.current.y < -25 ||
-      Math.abs(position.current.x) > 240 ||
-      Math.abs(position.current.z) > 240
+      playerState.position.y < WORLD_RESET_HEIGHT ||
+      Math.abs(playerState.position.x) > WORLD_BOUNDS ||
+      Math.abs(playerState.position.z) > WORLD_BOUNDS
     ) {
-      position.current.copy(spawnPoint);
-      velocity.current.set(0, 0, 0);
+      resetPlayerState(playerState);
     }
 
-    camera.position.copy(position.current);
-    onSpeedChange(velocity.current.length());
+    camera.position.copy(playerState.position);
+    onSpeedChange(playerState.velocity.length());
+    onSurfStateChange(playerState.isSurfing);
   });
 
   return null;
 };
 
-const Ramp = ({
-  rampRef,
-  config,
-}: {
-  rampRef: (node: THREE.Mesh | null) => void;
-  config: (typeof rampConfigs)[number];
-}) => (
-  <mesh
-    ref={rampRef}
-    rotation={config.rotation}
-    position={config.position}
-    receiveShadow
-  >
-    <boxGeometry args={config.size.toArray()} />
-    <meshStandardMaterial color="#2b6cb0" />
-  </mesh>
+const SurfWave = () => (
+  <>
+    <mesh
+      position={WAVE_CONFIG.position.toArray()}
+      rotation={WAVE_CONFIG.rotation}
+      receiveShadow
+      castShadow
+    >
+      <boxGeometry args={WAVE_CONFIG.size.toArray()} />
+      <meshStandardMaterial color="#3f8ca7" roughness={0.5} metalness={0.08} />
+    </mesh>
+
+    {FLOW_MARKERS.map((marker, index) => (
+      <mesh key={`flow-${index}`} position={marker.position.toArray()}>
+        <sphereGeometry args={[marker.size, 10, 10]} />
+        <meshStandardMaterial
+          color={marker.color}
+          emissive={marker.color}
+          emissiveIntensity={0.22}
+        />
+      </mesh>
+    ))}
+
+    <mesh position={UPHILL_BEACON.toArray()}>
+      <cylinderGeometry args={[0.8, 0.8, 7.6, 14]} />
+      <meshStandardMaterial
+        color="#f97316"
+        emissive="#f97316"
+        emissiveIntensity={0.45}
+      />
+    </mesh>
+    <mesh position={DOWNHILL_BEACON.toArray()}>
+      <cylinderGeometry args={[0.8, 0.8, 7.6, 14]} />
+      <meshStandardMaterial
+        color="#06b6d4"
+        emissive="#06b6d4"
+        emissiveIntensity={0.45}
+      />
+    </mesh>
+  </>
 );
 
 const Scene = ({
   onSpeedChange,
-  isMobile,
-  touchMove,
-  touchJump,
-  consumeLookDelta,
-  resetSignal,
+  onSurfStateChange,
 }: {
   onSpeedChange: (speed: number) => void;
-  isMobile: boolean;
-  touchMove: { x: number; y: number };
-  touchJump: boolean;
-  consumeLookDelta: () => { x: number; y: number };
-  resetSignal: number;
-}) => {
-  const rampRefs = useRef<Array<THREE.Mesh | null>>([]);
-  return (
-    <>
-      <color attach="background" args={["#05080d"]} />
-      <ambientLight intensity={0.35} />
-      <directionalLight position={[6, 12, 6]} intensity={0.9} />
-      {rampConfigs.map((config, index) => (
-        <Ramp
-          key={`ramp-${index}`}
-          config={config}
-          rampRef={(node) => {
-            rampRefs.current[index] = node;
-          }}
-        />
-      ))}
-      <mesh position={groundConfig.position.toArray()} receiveShadow>
-        <boxGeometry args={groundConfig.size.toArray()} />
-        <meshStandardMaterial color="#111827" />
-      </mesh>
-      <PlayerController
-        rampRefs={rampRefs}
-        onSpeedChange={onSpeedChange}
-        isMobile={isMobile}
-        touchMove={touchMove}
-        touchJump={touchJump}
-        consumeLookDelta={consumeLookDelta}
-        resetSignal={resetSignal}
-      />
-      {!isMobile && <PointerLockControls />}
-    </>
-  );
-};
+  onSurfStateChange: (isSurfing: boolean) => void;
+}) => (
+  <>
+    <color attach="background" args={["#9cc2d1"]} />
+    <Sky
+      distance={450000}
+      sunPosition={[30, 8, -15]}
+      turbidity={9}
+      rayleigh={1.35}
+      mieCoefficient={0.008}
+      mieDirectionalG={0.82}
+    />
+    <fog attach="fog" args={["#9fc4d2", 120, 780]} />
+    <ambientLight intensity={0.46} />
+    <hemisphereLight
+      skyColor="#d9f1ff"
+      groundColor="#2d4c5b"
+      intensity={0.48}
+    />
+    <directionalLight
+      position={[18, 26, 9]}
+      intensity={1.05}
+      castShadow
+      shadow-mapSize-width={1024}
+      shadow-mapSize-height={1024}
+    />
+
+    <SurfWave />
+
+    <mesh position={[0, -90, 0]} receiveShadow>
+      <boxGeometry args={[2200, 2, 2200]} />
+      <meshStandardMaterial color="#355260" />
+    </mesh>
+    <gridHelper
+      args={[2100, 210, "#7fb2c7", "#456675"]}
+      position={[0, -88.99, 0]}
+    />
+
+    <PlayerController
+      onSpeedChange={onSpeedChange}
+      onSurfStateChange={onSurfStateChange}
+    />
+    <PointerLockControls pointerSpeed={2.5} />
+  </>
+);
 
 export default function Home() {
   const [speed, setSpeed] = useState(0);
-  const [resetSignal, setResetSignal] = useState(0);
-  const isMobile = useIsMobile();
-  const { move, jump, setJump, consumeLookDelta, handlers } =
-    useTouchControls();
+  const [isSurfing, setIsSurfing] = useState(false);
 
   return (
-    <div className="relative h-screen w-screen overflow-hidden bg-black text-white">
+    <div className="relative h-screen w-screen overflow-hidden bg-slate-900 text-white">
       <Canvas
         shadows
-        camera={{ fov: 80, near: 0.1, far: 200, position: spawnPoint.toArray() }}
+        camera={{
+          fov: 74,
+          near: 0.1,
+          far: 2200,
+          position: SPAWN_POINT.toArray(),
+        }}
         onPointerDown={(event) => {
-          if (!isMobile) {
-            event.currentTarget.requestPointerLock();
-          }
+          event.currentTarget.requestPointerLock();
         }}
       >
-        <Scene
-          onSpeedChange={setSpeed}
-          isMobile={isMobile}
-          touchMove={move}
-          touchJump={jump}
-          consumeLookDelta={consumeLookDelta}
-          resetSignal={resetSignal}
-        />
+        <Scene onSpeedChange={setSpeed} onSurfStateChange={setIsSurfing} />
       </Canvas>
-      <div className="pointer-events-none absolute left-6 top-6 flex flex-col gap-2 rounded-lg bg-black/60 px-4 py-3 text-sm font-semibold uppercase tracking-wide">
-        <span className="text-xs text-blue-200">Surf Velocity</span>
-        <span className="text-2xl font-bold text-white">
+
+      <div className="pointer-events-none absolute left-6 top-6 rounded-lg bg-black/60 px-4 py-3 text-xs uppercase tracking-wide text-cyan-100">
+        <div className="text-[10px] text-cyan-300">Speed</div>
+        <div className="text-3xl font-bold text-white">
           {speed.toFixed(1)} u/s
-        </span>
-        <span className="text-[11px] text-slate-300">
-          WASD + mouse to air-strafe. Space to hop. R to reset.
-        </span>
+        </div>
+        <div className="text-[10px] text-slate-200">
+          {isSurfing ? "surf" : "air"}
+        </div>
       </div>
-      <div className="pointer-events-none absolute bottom-6 left-1/2 -translate-x-1/2 text-xs text-slate-300">
-        Click to lock mouse. On mobile, use the touch pads to surf.
+
+      <div className="pointer-events-none absolute right-6 top-6 rounded-lg bg-black/60 px-3 py-2 text-[11px] text-slate-100">
+        Orange marker: uphill spawn side
+        <br />
+        Cyan marker: downhill flow side
       </div>
-      {isMobile && (
-        <>
-          <div
-            className="pointer-events-auto absolute bottom-8 left-6 h-32 w-32 rounded-full border border-white/30 bg-white/5"
-            onTouchStart={handlers.handleMoveStart}
-            onTouchMove={handlers.handleMove}
-            onTouchEnd={handlers.handleMoveEnd}
-            onTouchCancel={handlers.handleMoveEnd}
-          >
-            <div className="absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white/20" />
-          </div>
-          <div
-            className="pointer-events-auto absolute bottom-8 right-6 h-32 w-32 rounded-full border border-white/30 bg-white/5"
-            onTouchStart={handlers.handleLookStart}
-            onTouchMove={handlers.handleLook}
-            onTouchEnd={handlers.handleLookEnd}
-            onTouchCancel={handlers.handleLookEnd}
-          >
-            <div className="absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white/20" />
-          </div>
-          <button
-            type="button"
-            className="pointer-events-auto absolute bottom-10 right-44 rounded-full border border-white/40 bg-white/10 px-4 py-2 text-xs uppercase tracking-wide"
-            onTouchStart={() => setJump(true)}
-            onTouchEnd={() => setJump(false)}
-            onTouchCancel={() => setJump(false)}
-          >
-            Jump
-          </button>
-          <button
-            type="button"
-            className="pointer-events-auto absolute bottom-10 right-64 rounded-full border border-white/40 bg-white/10 px-3 py-2 text-xs uppercase tracking-wide"
-            onClick={() => setResetSignal((prev) => prev + 1)}
-          >
-            Reset
-          </button>
-        </>
-      )}
+
+      <div className="pointer-events-none absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white/70" />
+
+      <div className="pointer-events-none absolute bottom-6 left-1/2 -translate-x-1/2 rounded-md bg-black/50 px-4 py-2 text-[11px] text-slate-100">
+        Click to lock mouse. Use A and D only while steering with mouse to
+        strafe and hold the wave. Press R to reset.
+      </div>
     </div>
   );
 }

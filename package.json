@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node tests/physics.test.js",
+    "test": "tsx tests/physics.test.ts",
     "prepare": "if [ -d .git ]; then git config core.hooksPath .githooks; fi"
   },
   "dependencies": {
@@ -26,6 +26,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",
+    "tsx": "^4.21.0",
     "typescript": "^5"
   }
 }
