@@ -13,6 +13,7 @@
     "isolatedModules": true,
     "jsx": "react-jsx",
     "incremental": true,
+    "types": ["@react-three/fiber", "node", "react", "react-dom"],
     "plugins": [
       {
         "name": "next"
@@ -28,7 +29,8 @@
     "**/*.tsx",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts",
-    "**/*.mts"
+    "**/*.mts",
+    "types/**/*.d.ts"
   ],
   "exclude": ["node_modules"]
 }
